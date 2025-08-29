@@ -11,17 +11,17 @@ jobs:
 
     env:
       THEOS: ${{ github.workspace }}/theos
-      IOS_VER: "14.4"
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 安装 theos + sdks（不装任何系统包，避免 apt 相关错误）
-      - name: Install theos and SDKs
+      # 安装 theos + sdks + toolchain
+      - name: Install theos, toolchain and SDKs
         shell: bash
         run: |
           set -euo pipefail
+
           echo "Clang on runner:"
           clang --version
 
@@ -30,35 +30,38 @@ jobs:
             git clone --depth=1 https://github.com/theos/theos.git "$THEOS"
           fi
 
-          # 拉 sdks 到 $THEOS/sdks
+          # 拉 sdks
           if [ ! -d "$THEOS/sdks" ]; then
             git clone --depth=1 https://github.com/theos/sdks.git "$THEOS/sdks"
           fi
 
+          # 拉 iOS toolchain for linux
+          if [ ! -d "$THEOS/toolchain" ]; then
+            mkdir -p "$THEOS/toolchain"
+            curl -L https://github.com/theos/toolchain-linux/releases/download/13.0/toolchain-linux-ios-13.0.tar.xz -o toolchain.tar.xz
+            tar -xJf toolchain.tar.xz -C "$THEOS/toolchain"
+          fi
+
           echo "Available SDKs:"
           ls -1 "$THEOS/sdks" || true
+          echo "Available toolchains:"
+          ls -R "$THEOS/toolchain" || true
 
-      # 可选：自动把 Makefile 的 TARGET 改为 14.4（若你已经手动设好，可以保留也不会出错）
-      - name: Force TARGET to iOS 14.4 (optional safety)
+      - name: Force TARGET to iOS 14.4
         shell: bash
         run: |
-          set -euo pipefail
           if [ -f Makefile ]; then
             if grep -qE '^[[:space:]]*TARGET[[:space:]]*:=' Makefile; then
               sed -i 's/^[[:space:]]*TARGET[[:space:]]*.*/TARGET := iphone:clang:latest:14.4/' Makefile
             else
-              printf "\n# Injected by CI\nTARGET := iphone:clang:latest:14.4\n" >> Makefile
+              printf "\nTARGET := iphone:clang:latest:14.4\n" >> Makefile
             fi
             echo "Makefile TARGET set to iphone:clang:latest:14.4"
-          else
-            echo "ERROR: Makefile not found in repo root!" >&2
-            exit 1
           fi
 
       - name: Build dylib
         shell: bash
         run: |
-          set -euo pipefail
           make clean || true
           make
           echo "Build done. Listing outputs:"
