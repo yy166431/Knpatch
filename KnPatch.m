@@ -1,139 +1,64 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
-#import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 
-#pragma mark - swizzle helper
-static void kn_swizzle(Class c, SEL old, SEL new) {
-    Method m1 = class_getInstanceMethod(c, old);
-    Method m2 = class_getInstanceMethod(c, new);
-    if (!m1 || !m2) return;
-    method_exchangeImplementations(m1, m2);
+// 简单工具：方法交换
+static void kn_swizzle(Class c, SEL o, SEL n) {
+    Method m1 = class_getInstanceMethod(c, o);
+    Method m2 = class_getInstanceMethod(c, n);
+    if (m1 && m2) method_exchangeImplementations(m1, m2);
 }
 
-#pragma mark - 工具：判断“疑似水印”的 UILabel
-static BOOL kn_isWatermarkLabel(UILabel *lab) {
-    if (!lab) return NO;
-    NSString *t = lab.text;
-    if (![t isKindOfClass:NSString.class]) return NO;
-    if (t.length == 0) return NO;
-
-    // 规则 1：包含这些关键词（可按需增删）
-    static NSArray<NSString *> *keys;
-    static dispatch_once_t onceToken;
-    dispatch_once(&onceToken, ^{
-        keys = @[@"watermark", @"Watermark", @"WM", @"标识", @"水印", @"UID", @"ID",
-                 @"kuniu", @"kuniu", @"kuniu",
-                 @"douyin", @"抖音", @"快手", @"ks", @"wechat", @"weixin"];
-    });
-    for (NSString *k in keys) {
-        if ([t rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) {
-            return YES;
-        }
+#pragma mark - 去水印（请按你的实际类名/层级微调）
+static BOOL isDigits(NSString *s) {
+    if (s.length < 6 || s.length > 12) return NO; // 依你的视频上“93xxx”来判定，必要时调整
+    for (NSUInteger i = 0; i < s.length; i++) {
+        unichar c = [s characterAtIndex:i];
+        if (c < '0' || c > '9') return NO;
     }
-
-    // 规则 2：一串 6~18 位纯数字（常见 UID/手机号样式）
-    NSCharacterSet *digits = [NSCharacterSet decimalDigitCharacterSet];
-    NSCharacterSet *notDigits = [digits invertedSet];
-    if ([t rangeOfCharacterFromSet:notDigits].location == NSNotFound) {
-        if (t.length >= 6 && t.length <= 18) return YES;
-    }
-
-    // 规则 3：非常浅的颜色 + 高 alpha 也可能是水印（保守处理）
-    CGFloat a = 1.0;
-    if (lab.textColor) {
-        [lab.textColor getRed:NULL green:NULL blue:NULL alpha:&a];
-        if (a < 0.35) return YES;
-    }
-
-    return NO;
+    return YES;
 }
 
-static BOOL kn_viewLooksLikeWatermark(UIView *v) {
-    if (!v) return NO;
-    NSString *cls = NSStringFromClass(v.class);
-    // 类名中出现 watermark/wm 等
-    NSArray *marks = @[@"Watermark", @"watermark", @"WM", @"wm", @"Mark", @"mark"];
-    for (NSString *m in marks) {
-        if ([cls rangeOfString:m options:NSCaseInsensitiveSearch].location != NSNotFound) {
-            return YES;
+static void hideDigitsInView(UIView *v) {
+    // 根据你 App 的实际水印视图调整。这里是一个“文本即是数字”的例子：
+    if ([v isKindOfClass:[UILabel class]]) {
+        UILabel *lab = (UILabel *)v;
+        if (isDigits(lab.text)) {
+            lab.hidden = YES;
+            lab.alpha = 0.0;
+            v.layer.opacity = 0.0;
+            v.userInteractionEnabled = NO;
         }
     }
-    // 小尺寸角落元素也可能是水印（可选，保守）
-    CGSize sz = v.bounds.size;
-    if (sz.width <= 160 && sz.height <= 80) {
-        CGPoint org = [v.superview convertPoint:v.frame.origin toView:v.window];
-        if (org.x <= 30 || org.y <= 30) return YES; // 左上角
-    }
-    return NO;
+    for (UIView *sub in v.subviews) hideDigitsInView(sub);
 }
 
-static void kn_hideWatermarkInView(UIView *root) {
-    if (!root) return;
-
-    if ([root isKindOfClass:UILabel.class]) {
-        UILabel *lab = (UILabel *)root;
-        if (kn_isWatermarkLabel(lab)) {
-            lab.hidden = YES;           // 隐藏
-            lab.alpha  = 0.0;
-            lab.layer.opacity = 0.0;
-            lab.userInteractionEnabled = NO;
-            return;
-        }
-    } else {
-        if (kn_viewLooksLikeWatermark(root)) {
-            root.hidden = YES;
-            root.alpha  = 0.0;
-            root.layer.opacity = 0.0;
-            root.userInteractionEnabled = NO;
-            return;
-        }
-    }
-
-    for (UIView *sub in root.subviews) {
-        kn_hideWatermarkInView(sub);
-    }
-}
-
-#pragma mark - 钩 UIView 的 didMoveToWindow，在每次入窗时清一次
-@interface UIView (KnPatch)
-@end
-
-@implementation UIView (KnPatch)
+@implementation UIView (KN_HideWatermark)
 - (void)kn_didMoveToWindow {
-    [self kn_didMoveToWindow]; // 调用原实现
-    // 安全地延时处理，以确保层级稳定
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.1 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        kn_hideWatermarkInView(self);
-    });
+    [self kn_didMoveToWindow];
+    // 将“水印所在的大容器视图”换成你实际的播放器容器（或使用更精确的类名判断）
+    // 这里用一个保守做法：只在视频区域较大的时候扫描，避免全局扫描影响性能。
+    if (self.window && self.bounds.size.height > 200) {
+        hideDigitsInView(self);
+    }
 }
 @end
 
-#pragma mark - 允许外接播放（某些 App 禁止投屏）
-@interface AVPlayer (KnPatch)
-@end
-@implementation AVPlayer (KnPatch)
-- (BOOL)kn_allowsExternalPlayback { return YES; }
-- (void)kn_setAllowsExternalPlayback:(BOOL)flag { [self kn_setAllowsExternalPlayback:YES]; }
-@end
-
-#pragma mark - 屏幕录制检测绕过（isCaptured→NO）
-@interface UIScreen (KnPatch)
-@end
-@implementation UIScreen (KnPatch)
-- (BOOL)kn_isCaptured { return NO; }
+#pragma mark - 录屏/投屏绕过：isCaptured恒为NO
+@implementation UIScreen (KN_CaptureBypass)
+- (BOOL)kn_isCaptured {
+    return NO; // 解除录屏/投屏检测
+}
 @end
 
-#pragma mark - 注入入口
 __attribute__((constructor))
 static void kn_init(void) {
-    // UIView didMoveToWindow
-    kn_swizzle(UIView.class, @selector(didMoveToWindow), @selector(kn_didMoveToWindow));
+    // 视图出现时尝试隐藏数字水印
+    kn_swizzle([UIView class], @selector(didMoveToWindow), @selector(kn_didMoveToWindow));
+    // 录屏检测绕过
+    kn_swizzle([UIScreen class], @selector(isCaptured), @selector(kn_isCaptured));
 
-    // UIScreen -isCaptured
-    kn_swizzle(UIScreen.class, @selector(isCaptured), @selector(kn_isCaptured));
-
-    // AVPlayer 允许外接播放
-    kn_swizzle(AVPlayer.class, @selector(allowsExternalPlayback), @selector(kn_allowsExternalPlayback));
-    kn_swizzle(AVPlayer.class, @selector(setAllowsExternalPlayback:), @selector(kn_setAllowsExternalPlayback:));
+    // ⚠️ 不再 swizzle AVPlayer 的 allowsExternalPlayback / setAllowsExternalPlayback
+    // 这能避免全屏时误走“外接播放”而黑屏。
 }
