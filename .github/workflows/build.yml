@@ -10,70 +10,52 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      THEOS: ${{ github.workspace }}/theos
+      THEOS: ${{ github.workspace }}/theos   # /home/runner/work/<repo>/<repo>/theos
+      SDK_VER: 14.5                          # 用 14.5 的 SDK，能在 14.4 跑
+      MIN_VER: 12.0
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 安装 theos + sdks + toolchain
       - name: Install theos, toolchain and SDKs
         shell: bash
         run: |
-          set -euo pipefail
+          set -eux
+          mkdir -p "$THEOS"
 
-          echo "Clang on runner:"
-          clang --version
+          echo "::group::Download toolchain"
+          # 每次都先删，避免空目录/坏缓存导致找不到 clang
+          rm -rf "$THEOS/toolchain"
+          curl -L -o toolchain.tar.xz \
+            https://github.com/theos/toolchain-linux/releases/latest/download/toolchain-linux-ios.tar.xz
+          tar -xJf toolchain.tar.xz -C "$THEOS"
+          ls -l "$THEOS/toolchain/usr/bin/clang"
+          echo "::endgroup::"
 
-          # 拉 theos
-          if [ ! -d "$THEOS" ]; then
-            git clone --depth=1 https://github.com/theos/theos.git "$THEOS"
-          fi
+          echo "::group::Download iPhoneOS SDK"
+          mkdir -p "$THEOS/sdks"
+          rm -rf "$THEOS/sdks/iPhoneOS${SDK_VER}.sdk"
+          curl -L -o sdk.tar.xz \
+            https://github.com/theos/sdks/releases/download/${SDK_VER}/iPhoneOS${SDK_VER}.sdk.tar.xz
+          tar -xJf sdk.tar.xz -C "$THEOS/sdks"
+          ls -d "$THEOS/sdks/iPhoneOS${SDK_VER}.sdk"
+          echo "::endgroup::"
 
-          # 拉 sdks
-          if [ ! -d "$THEOS/sdks" ]; then
-            git clone --depth=1 https://github.com/theos/sdks.git "$THEOS/sdks"
-          fi
-
-          # 拉 iOS toolchain for linux
-          if [ ! -d "$THEOS/toolchain" ]; then
-            mkdir -p "$THEOS/toolchain"
-            curl -L https://github.com/theos/toolchain-linux/releases/download/13.0/toolchain-linux-ios-13.0.tar.xz -o toolchain.tar.xz
-            tar -xJf toolchain.tar.xz -C "$THEOS/toolchain"
-          fi
-
-          echo "Available SDKs:"
-          ls -1 "$THEOS/sdks" || true
-          echo "Available toolchains:"
-          ls -R "$THEOS/toolchain" || true
-
-      - name: Force TARGET to iOS 14.4
+      - name: Force TARGET to iOS 14.4 (optional safety)
         shell: bash
         run: |
-          if [ -f Makefile ]; then
-            if grep -qE '^[[:space:]]*TARGET[[:space:]]*:=' Makefile; then
-              sed -i 's/^[[:space:]]*TARGET[[:space:]]*.*/TARGET := iphone:clang:latest:14.4/' Makefile
-            else
-              printf "\nTARGET := iphone:clang:latest:14.4\n" >> Makefile
-            fi
-            echo "Makefile TARGET set to iphone:clang:latest:14.4"
-          fi
+          sed -i 's/^TARGET.*/TARGET := iphone:clang:latest:14.4/' Makefile || true
 
       - name: Build dylib
         shell: bash
         run: |
+          set -eux
           make clean || true
           make
-          echo "Build done. Listing outputs:"
-          ls -al
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: KnPatch-iOS14.4
-          path: |
-            ./*.dylib
-            ./*.plist
-            ./build/**/*.dylib
-            ./build/**/*.plist
-          if-no-files-found: warn
+          name: KnPatch.dylib
+          path: KnPatch.dylib
