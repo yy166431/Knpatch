@@ -1,0 +1,54 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Prepare dirs
+        run: |
+          mkdir -p toolchain
+          mkdir -p iOS_SDK
+
+      - name: Download iOS toolchain (clang for iOS)
+        run: |
+          curl -L -o toolchain.tar.xz https://github.com/theos/toolchain-linux/releases/download/13.0/toolchain-linux-ios-13.0.tar.xz
+          tar -xJf toolchain.tar.xz -C toolchain --strip-components=1
+
+      - name: Download iPhoneOS14.5 SDK
+        run: |
+          curl -L -o iOS_SDK/iPhoneOS14.5.sdk.tar.xz https://github.com/qnblackcat/awesome-iOS/releases/download/ios-sdks/iPhoneOS14.5.sdk.tar.xz
+          tar -xJf iOS_SDK/iPhoneOS14.5.sdk.tar.xz -C iOS_SDK
+
+      - name: Build dylib
+        env:
+          TOOLCHAIN: ${{ github.workspace }}/toolchain/usr
+          SDK_PATH: ${{ github.workspace }}/iOS_SDK
+          SDK: iPhoneOS14.5.sdk
+          ARCH: arm64
+          MIN_IOS: "12.0"
+        run: |
+          export PATH="$TOOLCHAIN/bin:$PATH"
+          make TOOLCHAIN=${{ github.workspace }}/toolchain/usr SDK_PATH=$SDK_PATH SDK=$SDK ARCH=$ARCH MIN_IOS=$MIN_IOS
+          file KnPatch.dylib
+          ls -lh KnPatch.dylib
+
+      - name: Pack artifact
+        run: |
+          zip -9 KnPatch-dylib.zip KnPatch.dylib
+          ls -lh KnPatch-dylib.zip
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: KnPatch-dylib
+          path: KnPatch-dylib.zip
+          retention-days: 7
