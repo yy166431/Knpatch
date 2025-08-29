@@ -5,17 +5,17 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 
-#pragma mark - 简单交换工具
+#pragma mark - Swizzle helper
 static void kn_swizzle(Class c, SEL o, SEL n) {
     Method m1 = class_getInstanceMethod(c, o);
     Method m2 = class_getInstanceMethod(c, n);
     if (m1 && m2) method_exchangeImplementations(m1, m2);
 }
 
-#pragma mark - 去水印（按需调参/换类名）
-static BOOL kn_isDigitsString(NSString *s) {
+#pragma mark - 水印隐藏（按需要微调）
+static BOOL kn_isDigits(NSString *s) {
     if (!s) return NO;
-    if (s.length < 4 || s.length > 14) return NO; // 你的视频一般是“93xxx”一类的数字，可按需要微调
+    if (s.length < 3 || s.length > 12) return NO; // 依你的视频数字特征可再调
     for (NSUInteger i = 0; i < s.length; i++) {
         unichar c = [s characterAtIndex:i];
         if (c < '0' || c > '9') return NO;
@@ -24,47 +24,42 @@ static BOOL kn_isDigitsString(NSString *s) {
 }
 
 static void kn_hideDigitsInView(UIView *v) {
-    // 方案A：文本水印（UILabel）
     if ([v isKindOfClass:[UILabel class]]) {
         UILabel *lab = (UILabel *)v;
-        if (kn_isDigitsString(lab.text)) {
+        if (kn_isDigits(lab.text)) {
             lab.hidden = YES;
             lab.alpha = 0.0;
             v.layer.opacity = 0.0;
             v.userInteractionEnabled = NO;
         }
     }
-    // 方案B：如果你已经确认了水印具体类名，可以直接判断类名更精准，比如：
-    // if ([NSStringFromClass(v.class) isEqualToString:@"SBSWatermarkView"]) { v.hidden = YES; v.alpha = 0; }
-
     for (UIView *sub in v.subviews) kn_hideDigitsInView(sub);
 }
 
+// 只在较大的内容视图上扫描，避免性能抖动；如你知道具体容器类名，也可改成只对特定类扫描
 @implementation UIView (KN_HideWatermark)
 - (void)kn_didMoveToWindow {
     [self kn_didMoveToWindow];
-    // 只在比较“像视频区域”的大视图出现时扫描，避免性能问题
-    if (self.window && self.bounds.size.height > 200) {
+    if (self.window && self.bounds.size.height > 200 && self.bounds.size.width > 200) {
         kn_hideDigitsInView(self);
     }
 }
 @end
 
-#pragma mark - 解除录屏/镜像检测（投屏需要）
+#pragma mark - 录屏/投屏检测绕过
 @implementation UIScreen (KN_CaptureBypass)
 - (BOOL)kn_isCaptured {
-    // 始终返回 NO，让 App 认为未被录屏/镜像，从而放行投屏/录屏
+    // 始终返回 NO：允许录屏与镜像（App 看到的是“没在录屏/投屏”）
     return NO;
 }
 @end
 
-#pragma mark - 投屏（外接播放）安全开启
-// 只有检测到真的有外接/AirPlay 路由时，才允许外接播放；否则保持 App 原逻辑避免全屏黑屏
+#pragma mark - 仅在“真的有外接设备”时，允许 AVPlayer 外接播放
 static BOOL kn_hasExternalRoute(void) {
     AVAudioSessionRouteDescription *route = [AVAudioSession sharedInstance].currentRoute;
     for (AVAudioSessionPortDescription *o in route.outputs) {
         if ([o.portType isEqualToString:AVAudioSessionPortAirPlay] ||
-            [o.portType isEqualToString:AVAudioSessionPortHDMI]   ||
+            [o.portType isEqualToString:AVAudioSessionPortHDMI]  ||
             [o.portType isEqualToString:AVAudioSessionPortLineOut]) {
             return YES;
         }
@@ -72,41 +67,67 @@ static BOOL kn_hasExternalRoute(void) {
     return NO;
 }
 
-@implementation AVPlayer (KN_SafeExternal)
-- (void)kn_setAllowsExternalPlayback:(BOOL)flag {
-    // 如果有外接设备/路由，就放开；否则沿用 App 原 flag，避免误走外接播放导致黑屏
-    BOOL finalFlag = kn_hasExternalRoute() ? YES : flag;
-    [self kn_setAllowsExternalPlayback:finalFlag];
-}
-@end
-
-// （可选）一些 App 通过 AVPlayerViewController 的配置控制全屏/外接播放
-// 如果你遇到进全屏时依然会被误导，放开这段：仅当有外接路由时才“偏向”外接
-/*
-#import <AVKit/AVKit.h>
-@implementation AVPlayerViewController (KN_SafeExternal)
-- (void)kn_viewDidAppear:(BOOL)animated {
-    [self kn_viewDidAppear:animated];
-    if (kn_hasExternalRoute()) {
-        // 有外接路由时，允许外接屏时继续在外屏播放
-        self.requiresLinearPlayback = NO;
-        self.canStartPictureInPictureAutomaticallyFromInline = YES;
+// 方便给当前 player 按需配置
+static void kn_configurePlayerForExternal(AVPlayer *p) {
+    if (!p) return;
+    BOOL ext = kn_hasExternalRoute();
+    // 外接存在→允许外接播放；否则遵循 App 自己逻辑（保持现状）
+    if (ext) {
+        @try {
+            p.allowsExternalPlayback = YES;
+            if ([p respondsToSelector:@selector(setUsesExternalPlaybackWhileExternalScreenIsActive:)]) {
+                [p setUsesExternalPlaybackWhileExternalScreenIsActive:YES];
+            }
+        } @catch (__unused NSException *e) {}
     }
 }
+
+// swizzle init & setter，保证“有外接时”我们帮它开，没外接就不干预，避免黑屏
+@implementation AVPlayer (KN_SafeExternal)
+
+- (instancetype)kn_init {
+    id obj = [self kn_init];
+    kn_configurePlayerForExternal(obj);
+    return obj;
+}
+
+- (instancetype)kn_initWithPlayerItem:(AVPlayerItem *)item {
+    id obj = [self kn_initWithPlayerItem:item];
+    kn_configurePlayerForExternal(obj);
+    return obj;
+}
+
+// 只在有外接时把 flag 改成 YES，没外接就用原 flag，不破坏全屏
+- (void)kn_setAllowsExternalPlayback:(BOOL)flag {
+    BOOL ext = kn_hasExternalRoute();
+    [self kn_setAllowsExternalPlayback:(ext ? YES : flag)];
+}
+
 @end
-*/
+
+#pragma mark - 监听音频路由变化，外接出现/消失时给“未来的播放器”走正确分支
+static void kn_onRouteChange(NSNotification *note) {
+    // 这里只是为后续新建的 AVPlayer 提前确定策略；已有实例是否需要立即切换，交给 App 自己调用 setter。
+    // 如果你想更激进地“遍历并更新所有 AVPlayer 实例”，需要额外维护弱引用表，不建议在通用补丁里做。
+    (void)note;
+}
 
 __attribute__((constructor))
 static void kn_init(void) {
-    // 去水印
+    // 去水印 + 录屏绕过
     kn_swizzle([UIView class], @selector(didMoveToWindow), @selector(kn_didMoveToWindow));
-
-    // 录屏/镜像绕过（为“无限投屏/可录屏”服务）
     kn_swizzle([UIScreen class], @selector(isCaptured), @selector(kn_isCaptured));
 
-    // 投屏安全开启（只有检测到外接才放开，否则不干预 App 原逻辑，防止黑屏）
+    // AVPlayer：仅在有外接设备时，打开外接播放；否则不干预，避免黑屏
+    kn_swizzle([AVPlayer class], @selector(init), @selector(kn_init));
+    kn_swizzle([AVPlayer class], @selector(initWithPlayerItem:), @selector(kn_initWithPlayerItem:));
     kn_swizzle([AVPlayer class], @selector(setAllowsExternalPlayback:), @selector(kn_setAllowsExternalPlayback:));
 
-    // （可选）如果你启用上面的 AVPlayerViewController 类别，也要 swizzle：
-    // kn_swizzle([AVPlayerViewController class], @selector(viewDidAppear:), @selector(kn_viewDidAppear:));
+    // 路由变化监听（给将来新建的 player 做正确配置）
+    [[NSNotificationCenter defaultCenter] addObserverForName:AVAudioSessionRouteChangeNotification
+                                                      object:nil
+                                                       queue:[NSOperationQueue mainQueue]
+                                                  usingBlock:^(NSNotification * _Nonnull n) {
+        kn_onRouteChange(n);
+    }];
 }
