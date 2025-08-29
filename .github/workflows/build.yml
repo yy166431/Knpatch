@@ -10,72 +10,21 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Set up job
-        run: |
-          set -e
-          mkdir -p "$GITHUB_WORKSPACE/artifacts"
-
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Prepare dirs
+      # ✅ 不再下载 .tar.xz；直接克隆 theos 和 sdks
+      - name: Install iOS toolchain (theos + sdks)
         run: |
-          set -e
-          export THEOS=$GITHUB_WORKSPACE/theos
-          mkdir -p "$THEOS/toolchain" "$THEOS/sdks"
-
-      # 下载 iOS 工具链（latest + 多镜像 + 校验）
-      - name: Download iOS toolchain (multiple mirrors + retry)
-        run: |
-          set -e
-          export THEOS=$GITHUB_WORKSPACE/theos
-          URL_MAIN="https://github.com/theos/toolchain-linux/releases/latest/download/toolchain-linux-ios.tar.xz"
-          URL_GHPX="https://ghproxy.com/${URL_MAIN}"
-          URL_FG="https://download.fastgit.org/theos/toolchain-linux/releases/latest/download/toolchain-linux-ios.tar.xz"
-          for U in "$URL_MAIN" "$URL_GHPX" "$URL_FG"; do
-            echo "Trying $U"
-            if curl -fsSL -o toolchain.tar.xz "$U"; then
-              if xz -t toolchain.tar.xz 2>/dev/null; then
-                echo "toolchain ok"
-                break
-              else
-                echo "Invalid xz, try next mirror..."
-              fi
-            fi
-          done
-          xz -t toolchain.tar.xz
-          tar -xJf toolchain.tar.xz -C "$THEOS/toolchain" --strip-components=1
-          rm -f toolchain.tar.xz
-
-      # 下载 iPhoneOS 14.5 SDK（多镜像 + 校验）
-      - name: Download iPhoneOS14.5 SDK (multiple mirrors + retry)
-        run: |
-          set -e
-          export THEOS=$GITHUB_WORKSPACE/theos
-          SDK="iPhoneOS14.5.sdk"
-          URL_MAIN="https://github.com/theos/sdks/releases/download/ios14.5/${SDK}.tar.xz"
-          URL_GHPX="https://ghproxy.com/${URL_MAIN}"
-          URL_FG="https://download.fastgit.org/theos/sdks/releases/download/ios14.5/${SDK}.tar.xz"
-          for U in "$URL_MAIN" "$URL_GHPX" "$URL_FG"; do
-            echo "Trying $U"
-            if curl -fsSL -o sdk.tar.xz "$U"; then
-              if xz -t sdk.tar.xz 2>/dev/null; then
-                echo "sdk ok"
-                break
-              else
-                echo "Invalid xz, try next mirror..."
-              fi
-            fi
-          done
-          xz -t sdk.tar.xz
-          tar -xJf sdk.tar.xz -C "$THEOS/sdks"
-          rm -f sdk.tar.xz
+          sudo apt-get update
+          sudo apt-get install -y git clang make curl xz-utils
+          git clone --depth=1 https://github.com/theos/theos.git $GITHUB_WORKSPACE/theos
+          git clone --depth=1 https://github.com/theos/sdks.git  $GITHUB_WORKSPACE/theos/sdks
 
       - name: Build dylib
         env:
           THEOS: ${{ github.workspace }}/theos
         run: |
-          set -e
           make clean
           make
 
@@ -86,5 +35,5 @@ jobs:
           path: |
             ./*.dylib
             ./*.plist
-            ./build/*.dylib
-            ./build/*.plist
+            ./build/**/*.dylib
+            ./build/**/*.plist
