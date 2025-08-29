@@ -9,31 +9,68 @@ jobs:
   build:
     runs-on: ubuntu-latest
 
+    env:
+      THEOS: ${{ github.workspace }}/theos
+      IOS_VER: "14.4"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ✅ 不再下载 .tar.xz；直接克隆 theos 和 sdks
-      - name: Install iOS toolchain (theos + sdks)
+      # 安装 theos + sdks（不装任何系统包，避免 apt 相关错误）
+      - name: Install theos and SDKs
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y git clang make curl xz-utils
-          git clone --depth=1 https://github.com/theos/theos.git $GITHUB_WORKSPACE/theos
-          git clone --depth=1 https://github.com/theos/sdks.git  $GITHUB_WORKSPACE/theos/sdks
+          set -euo pipefail
+          echo "Clang on runner:"
+          clang --version
+
+          # 拉 theos
+          if [ ! -d "$THEOS" ]; then
+            git clone --depth=1 https://github.com/theos/theos.git "$THEOS"
+          fi
+
+          # 拉 sdks 到 $THEOS/sdks
+          if [ ! -d "$THEOS/sdks" ]; then
+            git clone --depth=1 https://github.com/theos/sdks.git "$THEOS/sdks"
+          fi
+
+          echo "Available SDKs:"
+          ls -1 "$THEOS/sdks" || true
+
+      # 可选：自动把 Makefile 的 TARGET 改为 14.4（若你已经手动设好，可以保留也不会出错）
+      - name: Force TARGET to iOS 14.4 (optional safety)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -f Makefile ]; then
+            if grep -qE '^[[:space:]]*TARGET[[:space:]]*:=' Makefile; then
+              sed -i 's/^[[:space:]]*TARGET[[:space:]]*.*/TARGET := iphone:clang:latest:14.4/' Makefile
+            else
+              printf "\n# Injected by CI\nTARGET := iphone:clang:latest:14.4\n" >> Makefile
+            fi
+            echo "Makefile TARGET set to iphone:clang:latest:14.4"
+          else
+            echo "ERROR: Makefile not found in repo root!" >&2
+            exit 1
+          fi
 
       - name: Build dylib
-        env:
-          THEOS: ${{ github.workspace }}/theos
+        shell: bash
         run: |
-          make clean
+          set -euo pipefail
+          make clean || true
           make
+          echo "Build done. Listing outputs:"
+          ls -al
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: KnPatch-artifacts
+          name: KnPatch-iOS14.4
           path: |
             ./*.dylib
             ./*.plist
             ./build/**/*.dylib
             ./build/**/*.plist
+          if-no-files-found: warn
