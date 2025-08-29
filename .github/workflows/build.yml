@@ -13,8 +13,7 @@ jobs:
       - name: Set up job
         run: |
           set -e
-          echo "WORK=$GITHUB_WORKSPACE"
-          mkdir -p $WORK/artifacts
+          mkdir -p "$GITHUB_WORKSPACE/artifacts"
 
       - name: Checkout
         uses: actions/checkout@v4
@@ -23,9 +22,9 @@ jobs:
         run: |
           set -e
           export THEOS=$GITHUB_WORKSPACE/theos
-          mkdir -p $THEOS/toolchain $THEOS/sdks
+          mkdir -p "$THEOS/toolchain" "$THEOS/sdks"
 
-      # ---------- 下载 iOS clang 工具链（带镜像与校验） ----------
+      # 下载 iOS 工具链（latest + 多镜像 + 校验）
       - name: Download iOS toolchain (multiple mirrors + retry)
         run: |
           set -e
@@ -36,12 +35,11 @@ jobs:
           for U in "$URL_MAIN" "$URL_GHPX" "$URL_FG"; do
             echo "Trying $U"
             if curl -fsSL -o toolchain.tar.xz "$U"; then
-              # 校验 xz 文件头是否正确
               if xz -t toolchain.tar.xz 2>/dev/null; then
                 echo "toolchain ok"
                 break
               else
-                echo "Downloaded file is not valid xz, retry next mirror..."
+                echo "Invalid xz, try next mirror..."
               fi
             fi
           done
@@ -49,7 +47,7 @@ jobs:
           tar -xJf toolchain.tar.xz -C "$THEOS/toolchain" --strip-components=1
           rm -f toolchain.tar.xz
 
-      # ---------- 下载 iPhoneOS 14.5 SDK（带镜像与校验） ----------
+      # 下载 iPhoneOS 14.5 SDK（多镜像 + 校验）
       - name: Download iPhoneOS14.5 SDK (multiple mirrors + retry)
         run: |
           set -e
@@ -65,26 +63,22 @@ jobs:
                 echo "sdk ok"
                 break
               else
-                echo "Downloaded file is not valid xz, retry next mirror..."
+                echo "Invalid xz, try next mirror..."
               fi
             fi
           done
           xz -t sdk.tar.xz
-          mkdir -p "$THEOS/sdks/${SDK}"
           tar -xJf sdk.tar.xz -C "$THEOS/sdks"
           rm -f sdk.tar.xz
 
-      # ---------- 编译你的纯 ObjC 动态库 ----------
       - name: Build dylib
         env:
           THEOS: ${{ github.workspace }}/theos
         run: |
           set -e
-          # 用 make（Theos）构建
           make clean
           make
 
-      # ---------- 打包产物 ----------
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
