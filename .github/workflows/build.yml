@@ -10,8 +10,8 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      THEOS: ${{ github.workspace }}/theos   # /home/runner/work/<repo>/<repo>/theos
-      SDK_VER: 14.5                          # 用 14.5 的 SDK，能在 14.4 跑
+      THEOS: ${{ github.workspace }}/theos
+      SDK_VER: 14.5
       MIN_VER: 12.0
 
     steps:
@@ -21,30 +21,62 @@ jobs:
       - name: Install theos, toolchain and SDKs
         shell: bash
         run: |
-          set -eux
+          set -euxo pipefail
+
+          # 1) 基础依赖
+          sudo apt-get update -y
+          sudo apt-get install -y curl xz-utils ca-certificates
+
           mkdir -p "$THEOS"
+          cd "$THEOS"
 
-          echo "::group::Download toolchain"
-          # 每次都先删，避免空目录/坏缓存导致找不到 clang
+          echo "=== Download toolchain (fixed version 13.0) ==="
           rm -rf "$THEOS/toolchain"
-          curl -L -o toolchain.tar.xz \
-            https://github.com/theos/toolchain-linux/releases/latest/download/toolchain-linux-ios.tar.xz
-          tar -xJf toolchain.tar.xz -C "$THEOS"
-          ls -l "$THEOS/toolchain/usr/bin/clang"
-          echo "::endgroup::"
+          mkdir -p "$THEOS/toolchain"   # 解压到 THEOS 根目录
 
-          echo "::group::Download iPhoneOS SDK"
+          # 多镜像顺序尝试
+          T_URLS=(
+            "https://github.com/theos/toolchain-linux/releases/download/13.0/toolchain-linux-ios-13.0.tar.xz"
+            "https://download.fastgit.org/theos/toolchain-linux/releases/download/13.0/toolchain-linux-ios-13.0.tar.xz"
+            "https://ghproxy.com/https://github.com/theos/toolchain-linux/releases/download/13.0/toolchain-linux-ios-13.0.tar.xz"
+          )
+          for u in "${T_URLS[@]}"; do
+            echo "Trying: $u"
+            if curl -fL --retry 5 --retry-all-errors -o toolchain.tar.xz "$u"; then
+              break
+            fi
+          done
+          # 确认下载到了文件
+          test -s toolchain.tar.xz
+
+          # 解压（到 $THEOS）
+          tar -xJf toolchain.tar.xz -C "$THEOS"
+          # 校验 clang 是否存在
+          ls -l "$THEOS/toolchain/usr/bin/clang"
+
+          echo "=== Download iPhoneOS SDK ${SDK_VER} ==="
           mkdir -p "$THEOS/sdks"
           rm -rf "$THEOS/sdks/iPhoneOS${SDK_VER}.sdk"
-          curl -L -o sdk.tar.xz \
-            https://github.com/theos/sdks/releases/download/${SDK_VER}/iPhoneOS${SDK_VER}.sdk.tar.xz
+
+          S_URLS=(
+            "https://github.com/theos/sdks/releases/download/${SDK_VER}/iPhoneOS${SDK_VER}.sdk.tar.xz"
+            "https://download.fastgit.org/theos/sdks/releases/download/${SDK_VER}/iPhoneOS${SDK_VER}.sdk.tar.xz"
+            "https://ghproxy.com/https://github.com/theos/sdks/releases/download/${SDK_VER}/iPhoneOS${SDK_VER}.sdk.tar.xz"
+          )
+          for u in "${S_URLS[@]}"; do
+            echo "Trying: $u"
+            if curl -fL --retry 5 --retry-all-errors -o sdk.tar.xz "$u"; then
+              break
+            fi
+          done
+          test -s sdk.tar.xz
           tar -xJf sdk.tar.xz -C "$THEOS/sdks"
           ls -d "$THEOS/sdks/iPhoneOS${SDK_VER}.sdk"
-          echo "::endgroup::"
 
       - name: Force TARGET to iOS 14.4 (optional safety)
         shell: bash
         run: |
+          # 可选：把 Makefile 里 TARGET 固定到 14.4
           sed -i 's/^TARGET.*/TARGET := iphone:clang:latest:14.4/' Makefile || true
 
       - name: Build dylib
