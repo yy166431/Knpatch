@@ -10,63 +10,87 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      - name: Set up job
+        run: |
+          set -e
+          echo "WORK=$GITHUB_WORKSPACE"
+          mkdir -p $WORK/artifacts
+
       - name: Checkout
         uses: actions/checkout@v4
 
       - name: Prepare dirs
         run: |
-          mkdir -p toolchain iOS_SDK
+          set -e
+          export THEOS=$GITHUB_WORKSPACE/theos
+          mkdir -p $THEOS/toolchain $THEOS/sdks
 
+      # ---------- 下载 iOS clang 工具链（带镜像与校验） ----------
       - name: Download iOS toolchain (multiple mirrors + retry)
-        shell: bash
         run: |
           set -e
-          urls=(
-            "https://github.com/theos/toolchain-linux/releases/download/13.0/toolchain-linux-ios-13.0.tar.xz"
-            "https://download.fastgit.org/theos/toolchain-linux/releases/download/13.0/toolchain-linux-ios-13.0.tar.xz"
-          )
-          for u in "${urls[@]}"; do
-            echo "Trying $u"
-            if curl -L --retry 5 --retry-delay 2 -o toolchain.tar.xz "$u"; then
-              echo "OK: $u"; break
+          export THEOS=$GITHUB_WORKSPACE/theos
+          URL_MAIN="https://github.com/theos/toolchain-linux/releases/latest/download/toolchain-linux-ios.tar.xz"
+          URL_GHPX="https://ghproxy.com/${URL_MAIN}"
+          URL_FG="https://download.fastgit.org/theos/toolchain-linux/releases/latest/download/toolchain-linux-ios.tar.xz"
+          for U in "$URL_MAIN" "$URL_GHPX" "$URL_FG"; do
+            echo "Trying $U"
+            if curl -fsSL -o toolchain.tar.xz "$U"; then
+              # 校验 xz 文件头是否正确
+              if xz -t toolchain.tar.xz 2>/dev/null; then
+                echo "toolchain ok"
+                break
+              else
+                echo "Downloaded file is not valid xz, retry next mirror..."
+              fi
             fi
           done
-          tar -xJf toolchain.tar.xz -C toolchain --strip-components=1
-          ls -lah toolchain/usr/bin | head
+          xz -t toolchain.tar.xz
+          tar -xJf toolchain.tar.xz -C "$THEOS/toolchain" --strip-components=1
+          rm -f toolchain.tar.xz
 
-      - name: Download iPhoneOS 14.5 SDK (multiple mirrors + retry)
-        shell: bash
+      # ---------- 下载 iPhoneOS 14.5 SDK（带镜像与校验） ----------
+      - name: Download iPhoneOS14.5 SDK (multiple mirrors + retry)
         run: |
           set -e
-          urls=(
-            "https://github.com/qnblackcat/awesome-iOS/releases/download/ios-sdks/iPhoneOS14.5.sdk.tar.xz"
-            "https://download.fastgit.org/qnblackcat/awesome-iOS/releases/download/ios-sdks/iPhoneOS14.5.sdk.tar.xz"
-          )
-          for u in "${urls[@]}"; do
-            echo "Trying $u"
-            if curl -L --retry 5 --retry-delay 2 -o iOS_SDK/iPhoneOS14.5.sdk.tar.xz "$u"; then
-              echo "OK: $u"; break
+          export THEOS=$GITHUB_WORKSPACE/theos
+          SDK="iPhoneOS14.5.sdk"
+          URL_MAIN="https://github.com/theos/sdks/releases/download/ios14.5/${SDK}.tar.xz"
+          URL_GHPX="https://ghproxy.com/${URL_MAIN}"
+          URL_FG="https://download.fastgit.org/theos/sdks/releases/download/ios14.5/${SDK}.tar.xz"
+          for U in "$URL_MAIN" "$URL_GHPX" "$URL_FG"; do
+            echo "Trying $U"
+            if curl -fsSL -o sdk.tar.xz "$U"; then
+              if xz -t sdk.tar.xz 2>/dev/null; then
+                echo "sdk ok"
+                break
+              else
+                echo "Downloaded file is not valid xz, retry next mirror..."
+              fi
             fi
           done
-          tar -xJf iOS_SDK/iPhoneOS14.5.sdk.tar.xz -C iOS_SDK
-          ls -lah iOS_SDK
+          xz -t sdk.tar.xz
+          mkdir -p "$THEOS/sdks/${SDK}"
+          tar -xJf sdk.tar.xz -C "$THEOS/sdks"
+          rm -f sdk.tar.xz
 
+      # ---------- 编译你的纯 ObjC 动态库 ----------
       - name: Build dylib
         env:
-            TOOLCHAIN_ROOT: ${{ github.workspace }}/toolchain/usr
-            SDK_PATH: ${{ github.workspace }}/iOS_SDK
-            SDK: iPhoneOS14.5.sdk
-            ARCH: arm64
-            MIN_IOS: "12.0"
+          THEOS: ${{ github.workspace }}/theos
         run: |
-          export PATH="$TOOLCHAIN_ROOT/bin:$PATH"
-          make TOOLCHAIN_ROOT="$TOOLCHAIN_ROOT" SDK_PATH="$SDK_PATH" SDK="$SDK" ARCH="$ARCH" MIN_IOS="$MIN_IOS"
-          file KnPatch.dylib
-          ls -lh KnPatch.dylib
+          set -e
+          # 用 make（Theos）构建
+          make clean
+          make
 
+      # ---------- 打包产物 ----------
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: KnPatch-dylib
-          path: KnPatch.dylib
-          retention-days: 7
+          name: KnPatch-artifacts
+          path: |
+            ./*.dylib
+            ./*.plist
+            ./build/*.dylib
+            ./build/*.plist
