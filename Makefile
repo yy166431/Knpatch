@@ -1,21 +1,22 @@
-# ===== Local / CI 通用 Makefile（可在 GitHub Actions 或本地工具链使用） =====
-# 如果在本地编译：把 TOOLCHAIN / SDK_PATH 改成你自己的路径
-TOOLCHAIN ?= $(PWD)/toolchain/usr
-SDK_PATH  ?= $(PWD)
-SDK       ?= iPhoneOS14.5.sdk
-ARCH      ?= arm64
-MIN_IOS   ?= 12.0
+# ===== User config =====
+SDK            ?= iPhoneOS14.5.sdk
+MIN_IOS        ?= 12.0
+ARCH           ?= arm64
 
-CC       := $(TOOLCHAIN)/bin/clang
-SYSROOT  := $(SDK_PATH)/$(SDK)
-CFLAGS   := -fobjc-arc -ObjC -isysroot $(SYSROOT) -arch $(ARCH) -miphoneos-version-min=$(MIN_IOS)
-LDFLAGS  := -dynamiclib
-FW       := -framework Foundation -framework UIKit -framework AVFoundation
+# ===== Auto paths =====
+# 这三个环境变量由 GitHub Actions 传进来；本地没有也能用默认值
+SDK_PATH       ?= $(PWD)/iOS_SDK
+TOOLCHAIN_ROOT ?= $(PWD)/toolchain/usr
+CLANG          := $(TOOLCHAIN_ROOT)/bin/clang
+
+CFLAGS  := -isysroot $(SDK_PATH)/$(SDK) -arch $(ARCH) -miphoneos-version-min=$(MIN_IOS) -fobjc-arc -O2
+LDFLAGS := -dynamiclib -fobjc-arc
+FW      := -framework Foundation -framework UIKit -framework AVFoundation
 
 all: KnPatch.dylib
 
 KnPatch.dylib: KnPatch.m
-	$(CC) $(LDFLAGS) $(CFLAGS) $(FW) $< -o $@
+	$(CLANG) $(LDFLAGS) $(CFLAGS) $(FW) -o $@ $<
 
 clean:
 	rm -f KnPatch.dylib
