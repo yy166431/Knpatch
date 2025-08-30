@@ -1,59 +1,78 @@
-// KnPatch.m
-// 进入就隐藏数字水印 + 允许投屏/录屏 + 会话级卡密验证（退出重进必输）
-// 适配 iOS 12+，纯 ObjC + runtime，无 Logos
+//
+//  KnPatch.m
+//  进入就清除数字水印 + 持续拦截新加入的水印视图
+//  + 会话级卡密验证（每次退出/回到前台都需重新输入）
+//
 
 #import <UIKit/UIKit.h>
 #import <AVFoundation/AVFoundation.h>
 #import <objc/runtime.h>
 
-#pragma mark - ===== 配置区 =====
+#pragma mark - 可按需修改的配置
 
-// 你的 App 包名（已经确认是 net.kuniu）
+/// 目标 App 包名（只在该 App 内生效）
 #define KN_BUNDLE_ID        @"net.kuniu"
 
-// 验证服务（POST）
-// 你的服务器： http://162.14.67.110:8080
-// 接口：POST /check   body: {"bundle":"net.kuniu","key":"xxxxxx"}
-// 返回：{"ok":true,"expires_at": 1234567890}
-#define KN_API_BASE         @"http://162.14.67.110:8080"
-#define KN_API_PATH         @"/check"
+/// 服务器地址（POST /check）
+#define KN_SERVER_BASE      @"http://162.14.67.110:8080"
+#define KN_CHECK_PATH       @"/check"
 
-// 是否“仅会话生效”（退出/后台->前台 都要重新输）: 1=是, 0=否
+/// 会话级授权：1=每次进入都要重新输入；0=允许本地缓存
 #define KN_SESSION_ONLY     1
 
-// 弹窗文案
-#define KN_ALRT_TITLE       @"请输入卡密"
-#define KN_ALRT_FAIL        @"验证失败，请检查卡密/网络后重试"
+/// 本地缓存键（只有在 KN_SESSION_ONLY=0 时才会使用）
+#define KN_UDEF_OK_KEY      @"kn_ok"
+#define KN_UDEF_EXP         @"kn_exp"
+#define KN_UDEF_LAST        @"kn_last"
 
-// （仅当 KN_SESSION_ONLY=0 时才会用到的）本地缓存键
-#define KN_UDEF_OK_KEY      @"kn.lic.ok"
-#define KN_UDEF_EXP         @"kn.lic.exp"
-#define KN_UDEF_LAST        @"kn.lic.last"
+#pragma mark - 内部状态
 
-// 如果启动页有广告，这个延迟可以让 UI 稳定后再弹窗，避免“假死”感
-#define KN_PROMPT_DELAY_SEC 0.35
+static BOOL kn_isLicensed = NO;
 
+#pragma mark - 通用小工具
 
-#pragma mark - ===== 全局状态 =====
+/// 简易方法交换
+static void kn_swizzle(Class c, SEL a, SEL b) {
+    Method m1 = class_getInstanceMethod(c, a);
+    Method m2 = class_getInstanceMethod(c, b);
+    if (!m1 || !m2) return;
+    method_exchangeImplementations(m1, m2);
+}
 
-static BOOL kn_isLicensed = NO;   // 会话内授权态（本次打开 App 是否已通过）
-static BOOL kn_prompting  = NO;   // 正在显示输入框，避免重复弹
+/// 获取最顶层可展示控制器
+static UIViewController *kn_topVC(void) {
+    UIWindow *win = UIApplication.sharedApplication.keyWindow;
+    if (!win) win = UIApplication.sharedApplication.windows.firstObject;
+    UIViewController *vc = win.rootViewController;
+    while (1) {
+        if (vc.presentedViewController) {
+            vc = vc.presentedViewController;
+        } else if ([vc isKindOfClass:UINavigationController.class]) {
+            vc = ((UINavigationController *)vc).visibleViewController;
+        } else if ([vc isKindOfClass:UITabBarController.class]) {
+            vc = ((UITabBarController *)vc).selectedViewController;
+        } else {
+            break;
+        }
+    }
+    return vc;
+}
 
+#pragma mark - 去数字水印核心
 
-#pragma mark - ===== 小工具：隐藏视图里“纯数字/编号”的 UILabel =====
-
+/// 小工具：剔除并隐藏“纯数字/号码”的 UILabel
 static void kn_hideDigitsInView(UIView *v) {
     if (!v) return;
 
-    // 1) 自身是 UILabel 且文本看起来是“短数字/编号”
-    if ([v isKindOfClass:[UILabel class]]) {
+    // 1) 自身是否是嫌疑的 UILabel
+    if ([v isKindOfClass:UILabel.class]) {
         UILabel *lbl = (UILabel *)v;
-        NSString *t = lbl.text ?: @"";
-        // 只允许 0-9 和 . 号，长度 3~8（按你之前习惯，避免把普通文案误杀）
-        if (t.length >= 3 && t.length <= 8) {
-            NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"0123456789."];            
-            NSString *trim = [[t componentsSeparatedByCharactersInSet:allowed.invertedSet] componentsJoinedByString:@""];
-            if ([trim isEqualToString:t]) {
+        NSString *txt = lbl.text ?: @"";
+        // 只允许 5~8 位，且仅包含 0~9 的 “号码”（避免误伤普通文案）
+        if (txt.length >= 5 && txt.length <= 8) {
+            NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"0123456789"];
+            NSString *trim = [[txt componentsSeparatedByCharactersInSet:allowed.invertedSet] componentsJoinedByString:@""];
+            if ([trim isEqualToString:txt]) {
                 lbl.hidden = YES;
                 lbl.alpha  = 0.0;
                 lbl.userInteractionEnabled = NO;
@@ -61,264 +80,204 @@ static void kn_hideDigitsInView(UIView *v) {
         }
     }
 
-    // 2) 递归子视图
+    // 2) 递归清理子视图
     for (UIView *sub in v.subviews) {
         kn_hideDigitsInView(sub);
     }
 }
 
+#pragma mark - Hook：UIView didAddSubview（新视图加入就清理一次）
 
-#pragma mark - ===== Hook: UIView didAddSubview（任何新视图加入都扫一次） =====
+@implementation UIView (KN_NoDigits)
 
-static void (*kn_orig_didAddSubview)(UIView *, SEL, UIView *);
-static void kn_sw_didAddSubview(UIView *self, SEL _cmd, UIView *sub) {
-    kn_orig_didAddSubview(self, _cmd, sub);
-    // 仅在授权后才做隐藏
-    if (kn_isLicensed) {
-        // 延后一点点，等布局完成
-        dispatch_async(dispatch_get_main_queue(), ^{
-            kn_hideDigitsInView(sub);
-        });
-    }
+- (void)kn_orig_didAddSubview:(UIView *)sub { [self kn_orig_didAddSubview:sub]; }
+
+- (void)kn_didAddSubview:(UIView *)sub {
+    [self kn_didAddSubview:sub];   // 调用原实现
+    // 只在目标 App 内生效，避免影响其它 App
+    NSString *bid = [NSBundle.mainBundle bundleIdentifier] ?: @"";
+    if (![bid isEqualToString:KN_BUNDLE_ID]) return;
+    if (!kn_isLicensed) return;    // 未授权不处理
+    kn_hideDigitsInView(sub);
 }
+@end
 
+#pragma mark - Hook：UIViewController viewDidAppear（进入页面后再补一次）
 
-#pragma mark - ===== Hook: UIViewController viewDidAppear（进入页后再扫一遍） =====
+@implementation UIViewController (KN_NoDigits)
 
-static void (*kn_orig_vc_viewDidAppear)(UIViewController *, SEL, BOOL);
-static void kn_sw_vc_viewDidAppear(UIViewController *self, SEL _cmd, BOOL animated) {
-    kn_orig_vc_viewDidAppear(self, _cmd, animated);
+- (void)kn_orig_viewDidAppear:(BOOL)animated { [self kn_orig_viewDidAppear:animated]; }
 
-    // 仅在授权后才隐藏
-    if (kn_isLicensed) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            kn_hideDigitsInView(self.view);
-        });
-    }
+- (void)kn_viewDidAppear:(BOOL)animated {
+    [self kn_viewDidAppear:animated];
+
+    NSString *bid = [NSBundle.mainBundle bundleIdentifier] ?: @"";
+    if (![bid isEqualToString:KN_BUNDLE_ID]) return;
+    if (!kn_isLicensed) return;
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        __strong typeof(weakSelf) self2 = weakSelf;
+        if (!self2) return;
+        kn_hideDigitsInView(self2.view);
+    });
 }
+@end
 
+#pragma mark - 授权：会话级卡密验证（POST /check）
 
-#pragma mark - ===== 允许投屏：AVPlayer allowsExternalPlayback 永远 YES =====
+/// 组装校验请求
+static NSURLRequest *kn_makeCheckRequest(NSString *key) {
+    NSString *bundle = [NSBundle.mainBundle bundleIdentifier] ?: @"";
+    NSString *device = UIDevice.currentDevice.identifierForVendor.UUIDString ?: @"";
+    NSDictionary *payload = @{
+        @"bundle": bundle,
+        @"key": key ?: @"",
+        @"device": device
+    };
 
-static void (*kn_orig_setAllowExt)(AVPlayer *, SEL, BOOL);
-static void kn_sw_setAllowExt(AVPlayer *self, SEL _cmd, BOOL flag) {
-    // 强制打开
-    kn_orig_setAllowExt(self, _cmd, YES);
-}
-static BOOL kn_sw_allowsExternalPlayback(AVPlayer *self, SEL _cmd) {
-    return YES;
-}
-
-
-#pragma mark - ===== 允许录屏：UIScreen isCaptured -> NO =====
-
-// iOS 11+ 有 isCaptured，旧系统也能安全处理
-static BOOL (*kn_orig_isCaptured)(UIScreen *, SEL);
-static BOOL kn_sw_isCaptured(UIScreen *self, SEL _cmd) {
-    // 已授权后，强制“没有被捕获”，从而允许系统录屏/投屏
-    if (kn_isLicensed) return NO;
-    if (kn_orig_isCaptured) return kn_orig_isCaptured(self, _cmd);
-    return NO;
-}
-
-
-#pragma mark - ===== 运行时交换工具 =====
-
-static void kn_swizzle(Class c, SEL orig, SEL swiz) {
-    Method m1 = class_getInstanceMethod(c, orig);
-    Method m2 = class_getInstanceMethod(c, swiz);
-    if (!m1 || !m2) return;
-    method_exchangeImplementations(m1, m2);
-}
-
-
-#pragma mark - ===== 卡密验证：UI + POST =====
-
-static void kn_doVerify(NSString *key, void (^onOK)(void)) {
-    if (key.length == 0) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            UIAlertController *a = [UIAlertController alertControllerWithTitle:KN_ALRT_FAIL
-                                                                       message:nil
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-            [a addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
-            [UIApplication.sharedApplication.keyWindow.rootViewController presentViewController:a animated:YES completion:nil];
-        });
-        return;
-    }
-
-    NSURL *url = [NSURL URLWithString:[KN_API_BASE stringByAppendingString:KN_API_PATH]];
+    NSURL *url = [NSURL URLWithString:[KN_SERVER_BASE stringByAppendingString:KN_CHECK_PATH]];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:url];
     req.HTTPMethod = @"POST";
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    req.timeoutInterval = 10.0;
 
-    NSDictionary *body = @{
-        @"bundle": KN_BUNDLE_ID,
-        @"key":    key ?: @""
-    };
-    NSData *data = [NSJSONSerialization dataWithJSONObject:body options:0 error:nil];
+    NSData *data = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
     req.HTTPBody = data;
-
-    NSURLSessionDataTask *task = [NSURLSession.sharedSession dataTaskWithRequest:req
-                                                               completionHandler:^(NSData * _Nullable d, NSURLResponse * _Nullable r, NSError * _Nullable e) {
-        BOOL ok = NO;
-        NSTimeInterval expTS = 0;
-
-        if (!e && d.length > 0) {
-            NSDictionary *json = [NSJSONSerialization JSONObjectWithData:d options:0 error:nil];
-            if ([json isKindOfClass:[NSDictionary class]]) {
-                ok = [json[@"ok"] boolValue];
-                if (json[@"expires_at"]) expTS = [json[@"expires_at"] doubleValue];
-            }
-        }
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            if (ok) {
-                kn_isLicensed = YES;
-
-#if !KN_SESSION_ONLY
-                // 可持久化时才缓存
-                NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-                [ud setBool:YES forKey:KN_UDEF_OK_KEY];
-                if (expTS > 0) [ud setDouble:expTS forKey:KN_UDEF_EXP];
-                [ud setDouble:[[NSDate date] timeIntervalSince1970] forKey:KN_UDEF_LAST];
-                [ud synchronize];
-#endif
-                if (onOK) onOK();
-            } else {
-                UIAlertController *a = [UIAlertController alertControllerWithTitle:KN_ALRT_FAIL
-                                                                           message:nil
-                                                                    preferredStyle:UIAlertControllerStyleAlert];
-                [a addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleDefault handler:nil]];
-                [UIApplication.sharedApplication.keyWindow.rootViewController presentViewController:a animated:YES completion:nil];
-            }
-        });
-    }];
-    [task resume];
+    return req;
 }
 
+/// 弹框输入 & 远端验证；成功则 kn_isLicensed=YES（会话内有效）
 static void kn_promptLicenseIfNeeded(void (^onOK)(void)) {
-    if (kn_isLicensed || kn_prompting) return;
-    if (![UIApplication sharedApplication].keyWindow) {
-        // 还没窗口：稍后再弹
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(KN_PROMPT_DELAY_SEC * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            kn_promptLicenseIfNeeded(onOK);
-        });
-        return;
-    }
+    if (kn_isLicensed) { if (onOK) onOK(); return; }
 
-    kn_prompting = YES;
+#if !KN_SESSION_ONLY
+    // 可缓存模式：读缓存（你若永远会话模式可删除此段）
+    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+    BOOL ok = [ud boolForKey:KN_UDEF_OK_KEY];
+    NSTimeInterval exp = [ud doubleForKey:KN_UDEF_EXP];
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    if (ok && (exp <= 0 || now < exp)) { kn_isLicensed = YES; if (onOK) onOK(); return; }
+#endif
 
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:KN_ALRT_TITLE
+    UIViewController *presenter = kn_topVC();
+    if (!presenter) return;
+
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"请输入卡密"
                                                                 message:nil
                                                          preferredStyle:UIAlertControllerStyleAlert];
     [ac addTextFieldWithConfigurationHandler:^(UITextField * _Nonnull tf) {
         tf.placeholder = @"粘贴/输入卡密";
         tf.keyboardType = UIKeyboardTypeASCIICapable;
-        tf.autocorrectionType = UITextAutocorrectionTypeNo;
         tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
-        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
     }];
-    __weak UIAlertController *weakAC = ac;
-    [ac addAction:[UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction * _Nonnull act) {
-        __strong UIAlertController *sac = weakAC;
-        NSString *key = sac.textFields.firstObject.text ?: @"";
-        kn_prompting = NO;
-        kn_doVerify(key, onOK);
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"退出" style:UIAlertActionStyleCancel handler:^(__unused UIAlertAction * _Nonnull act) {
-        kn_prompting = NO;
-    }]];
 
-    UIViewController *root = UIApplication.sharedApplication.keyWindow.rootViewController;
-    [root presentViewController:ac animated:YES completion:nil];
+    __weak UIAlertController *weakAC = ac;
+
+    UIAlertAction *okAct = [UIAlertAction actionWithTitle:@"确定" style:UIAlertActionStyleDefault handler:^(__unused UIAlertAction * _Nonnull act) {
+        NSString *key = weakAC.textFields.firstObject.text ?: @"";
+        if (key.length == 0) {
+            [presenter.view endEditing:YES];
+            return;
+        }
+
+        NSURLRequest *req = kn_makeCheckRequest(key);
+        [[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData * _Nullable data, NSURLResponse * _Nullable response, NSError * _Nullable error) {
+            BOOL pass = NO;
+            NSTimeInterval expTS = 0;
+
+            if (!error && data.length > 0) {
+                NSDictionary *json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                // 兼容 {ok:true,expires_at:...} 或 {ok:1}
+                id okVal = json[@"ok"];
+                if ([okVal respondsToSelector:@selector(boolValue)] && [okVal boolValue]) {
+                    pass = YES;
+                    id expVal = json[@"expires_at"];
+                    if ([expVal respondsToSelector:@selector(doubleValue)]) expTS = [expVal doubleValue];
+                }
+            }
+
+            dispatch_async(dispatch_get_main_queue(), ^{
+                if (pass) {
+                    kn_isLicensed = YES;
+
+#if !KN_SESSION_ONLY
+                    // 只有允许缓存时才落盘
+                    NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+                    [ud setBool:YES forKey:KN_UDEF_OK_KEY];
+                    if (expTS > 0) [ud setDouble:expTS forKey:KN_UDEF_EXP];
+                    [ud setDouble:NSDate.date.timeIntervalSince1970 forKey:KN_UDEF_LAST];
+                    [ud synchronize];
+#endif
+                    if (onOK) onOK();
+                } else {
+                    UIAlertController *tip = [UIAlertController alertControllerWithTitle:@"验证失败"
+                                                                                message:@"请检查卡密/网络后重试"
+                                                                         preferredStyle:UIAlertControllerStyleAlert];
+                    [tip addAction:[UIAlertAction actionWithTitle:@"好的" style:UIAlertActionStyleCancel handler:nil]];
+                    [presenter presentViewController:tip animated:YES completion:nil];
+                }
+            });
+        }] resume];
+    }];
+
+    UIAlertAction *cancel = [UIAlertAction actionWithTitle:@"退出" style:UIAlertActionStyleDestructive handler:^(__unused UIAlertAction * _Nonnull act) {
+        // 用户拒绝：不授权
+    }];
+
+    [ac addAction:okAct];
+    [ac addAction:cancel];
+    [presenter presentViewController:ac animated:YES completion:nil];
 }
 
-
-#pragma mark - ===== 入口：安装 Hook + 会话授权策略 =====
+#pragma mark - 入口：安装 Hook & 会话授权流程
 
 __attribute__((constructor))
 static void kn_entry(void) {
-    // 仅在指定包生效
+    // 仅目标 App 生效
     NSString *bid = [NSBundle.mainBundle bundleIdentifier] ?: @"";
     if (![bid isEqualToString:KN_BUNDLE_ID]) return;
 
-    // Hook：隐藏数字水印（添加子视图 & 出现页面）
-    kn_orig_didAddSubview = (void *)class_getInstanceMethod(UIView.class, @selector(didAddSubview:));
-    if (kn_orig_didAddSubview) {
-        class_addMethod(UIView.class, @selector(kn_sw_didAddSubview:), (IMP)kn_sw_didAddSubview, "v@:@");
-        kn_swizzle(UIView.class, @selector(didAddSubview:), @selector(kn_sw_didAddSubview:));
-    }
-
-    kn_orig_vc_viewDidAppear = (void *)class_getInstanceMethod(UIViewController.class, @selector(viewDidAppear:));
-    if (kn_orig_vc_viewDidAppear) {
-        class_addMethod(UIViewController.class, @selector(kn_sw_vc_viewDidAppear:), (IMP)kn_sw_vc_viewDidAppear, "v@:B");
-        kn_swizzle(UIViewController.class, @selector(viewDidAppear:), @selector(kn_sw_vc_viewDidAppear:));
-    }
-
-    // Hook：投屏
-    if (class_getInstanceMethod(AVPlayer.class, @selector(setAllowsExternalPlayback:))) {
-        kn_orig_setAllowExt = (void *)class_getInstanceMethod(AVPlayer.class, @selector(setAllowsExternalPlayback:));
-        class_addMethod(AVPlayer.class, @selector(kn_sw_setAllowExt:), (IMP)kn_sw_setAllowExt, "v@:B");
-        kn_swizzle(AVPlayer.class, @selector(setAllowsExternalPlayback:), @selector(kn_sw_setAllowExt:));
-    }
-    if (class_getInstanceMethod(AVPlayer.class, @selector(allowsExternalPlayback))) {
-        class_addMethod(AVPlayer.class, @selector(kn_sw_allowsExternalPlayback), (IMP)kn_sw_allowsExternalPlayback, "B@:");
-        kn_swizzle(AVPlayer.class, @selector(allowsExternalPlayback), @selector(kn_sw_allowsExternalPlayback));
-    }
-
-    // Hook：录屏
-    if ([UIScreen.mainScreen respondsToSelector:@selector(isCaptured)]) {
-        Method m = class_getInstanceMethod(UIScreen.class, @selector(isCaptured));
-        if (m) {
-            kn_orig_isCaptured = (BOOL (*)(UIScreen*,SEL))method_getImplementation(m);
-            class_addMethod(UIScreen.class, @selector(kn_sw_isCaptured), (IMP)kn_sw_isCaptured, "B@:");
-            kn_swizzle(UIScreen.class, @selector(isCaptured), @selector(kn_sw_isCaptured));
-        }
-    }
+    // Hook
+    kn_swizzle(UIView.class, @selector(didAddSubview:), @selector(kn_didAddSubview:));
+    kn_swizzle(UIViewController.class, @selector(viewDidAppear:), @selector(kn_viewDidAppear:));
 
 #if KN_SESSION_ONLY
-    // 会话模式：冷启动 / 回前台 均要求验证；退后台清状态
+    // 会话模式：冷启动弹一次；回到前台若未授权则再弹；退到后台清空授权
     kn_isLicensed = NO;
 
-    // 冷启动：延后一点点，等 UI 稳定后弹
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(KN_PROMPT_DELAY_SEC * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-        kn_promptLicenseIfNeeded(^{
-            // 验证通过后，立刻对当前可见页面做一次清理
-            UIViewController *vc = UIApplication.sharedApplication.keyWindow.rootViewController;
-            if (vc) kn_hideDigitsInView(vc.view);
-        });
+    dispatch_async(dispatch_get_main_queue(), ^{
+        kn_promptLicenseIfNeeded(NULL);
     });
 
-    // 回前台：如果未授权，再次弹
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification * _Nonnull note) {
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationWillEnterForegroundNotification
+                                                    object:nil
+                                                     queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(__unused NSNotification * _Nonnull n) {
         if (!kn_isLicensed) {
-            kn_promptLicenseIfNeeded(^{
-                UIViewController *vc = UIApplication.sharedApplication.keyWindow.rootViewController;
-                if (vc) kn_hideDigitsInView(vc.view);
-            });
+            kn_promptLicenseIfNeeded(NULL);
         }
     }];
 
-    // 退后台：清掉授权，确保回来必输
-    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:NSOperationQueue.mainQueue usingBlock:^(__unused NSNotification * _Nonnull note) {
+    [NSNotificationCenter.defaultCenter addObserverForName:UIApplicationDidEnterBackgroundNotification
+                                                    object:nil
+                                                     queue:NSOperationQueue.mainQueue
+                                                usingBlock:^(__unused NSNotification * _Nonnull n) {
         kn_isLicensed = NO;
     }];
 #else
-    // 可缓存：读取本地授权（如过期或未授权则弹窗）
+    // 允许缓存模式：仅首次不合法时弹窗
     NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
-    BOOL cachedOK = [ud boolForKey:KN_UDEF_OK_KEY];
-    NSTimeInterval exp  = [ud doubleForKey:KN_UDEF_EXP];
-    NSTimeInterval now  = NSDate.date.timeIntervalSince1970;
-
-    if (cachedOK && (exp <= 0 || now < exp)) {
+    BOOL ok = [ud boolForKey:KN_UDEF_OK_KEY];
+    NSTimeInterval exp = [ud doubleForKey:KN_UDEF_EXP];
+    NSTimeInterval now = NSDate.date.timeIntervalSince1970;
+    if (ok && (exp <= 0 || now < exp)) {
         kn_isLicensed = YES;
     } else {
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(KN_PROMPT_DELAY_SEC * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-            kn_promptLicenseIfNeeded(^{
-                UIViewController *vc = UIApplication.sharedApplication.keyWindow.rootViewController;
-                if (vc) kn_hideDigitsInView(vc.view);
-            });
+        dispatch_async(dispatch_get_main_queue(), ^{
+            kn_promptLicenseIfNeeded(NULL);
         });
     }
 #endif
 }
+
